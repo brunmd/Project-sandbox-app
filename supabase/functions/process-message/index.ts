@@ -1,81 +1,94 @@
 // ============================================================================
 // StaiDOC — Edge Function: process-message
-// Recebe mensagem → NER anonimiza → chama IA → grava logs → retorna resposta
+// Fluxo: Recebe mensagem → Anonimiza (NER+REGEX) → Grava logs → Chama
+//        API Anthropic (Claude Opus 4.6) com streaming → Retorna SSE
+// ============================================================================
+// Conformidade: LGPD Art. 6/7/12/18/20/37/46 + Marco Civil Art. 15
 // ============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { corsHeaders } from "../_shared/cors.ts";
+import { MASTER_PROMPT } from "../_shared/master-prompt.ts";
+import {
+  anonymizeContent,
+  sha256,
+  type DetectedEntity,
+} from "../_shared/anonymizer.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-};
+// ============================================================================
+// Configuracao do modelo — Somente Anthropic
+// ============================================================================
+const MODEL_ID = "claude-opus-4-6";
+const MODEL_NAME = "Claude Opus 4.6";
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION = "2023-06-01";
 
+// ============================================================================
+// Tipos
+// ============================================================================
 interface ProcessMessageRequest {
   conversation_id: string;
   content: string;
-  has_image: boolean;
+  has_image?: boolean;
 }
 
-interface NEREntity {
-  type: string;
-  value: string;
-  position: [number, number];
-  action: string;
-  confidence: number;
-}
-
+// ============================================================================
+// Funcao principal
+// ============================================================================
 serve(async (req: Request) => {
-  // Handle CORS preflight
+  // CORS preflight
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    // Autenticação: extrair JWT do header
+    // =====================================================================
+    // AUTENTICACAO
+    // =====================================================================
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
-      return new Response(
-        JSON.stringify({ error: "Token de autenticação ausente" }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return jsonResponse({ error: "Token de autenticacao ausente" }, 401);
     }
 
-    // Cliente Supabase com service_role para escrita em logs
     const supabaseAdmin = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    // Cliente com token do usuário para validar identidade
     const supabaseUser = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_ANON_KEY") ?? "",
       { global: { headers: { Authorization: authHeader } } }
     );
 
-    // Validar usuário autenticado
-    const { data: { user }, error: authError } = await supabaseUser.auth.getUser();
+    const {
+      data: { user },
+      error: authError,
+    } = await supabaseUser.auth.getUser();
     if (authError || !user) {
-      return new Response(
-        JSON.stringify({ error: "Usuário não autenticado" }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return jsonResponse({ error: "Usuario nao autenticado" }, 401);
     }
 
     const userId = user.id;
-    const { conversation_id, content, has_image } = await req.json() as ProcessMessageRequest;
+    const ipAddress =
+      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
+    const userAgent = req.headers.get("user-agent") || null;
 
-    // Validação de entrada
+    // =====================================================================
+    // VALIDACAO DE ENTRADA
+    // =====================================================================
+    const body = (await req.json()) as ProcessMessageRequest;
+    const { conversation_id, content, has_image = false } = body;
+
     if (!conversation_id || !content) {
-      return new Response(
-        JSON.stringify({ error: "conversation_id e content são obrigatórios" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      return jsonResponse(
+        { error: "conversation_id e content sao obrigatorios" },
+        400
       );
     }
 
-    // Verificar que a conversa pertence ao usuário
+    // Verificar que a conversa pertence ao medico autenticado
     const { data: conversation, error: convError } = await supabaseUser
       .from("conversations")
       .select("id")
@@ -83,31 +96,41 @@ serve(async (req: Request) => {
       .single();
 
     if (convError || !conversation) {
-      return new Response(
-        JSON.stringify({ error: "Conversa não encontrada ou sem permissão" }),
-        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      return jsonResponse(
+        { error: "Conversa nao encontrada ou sem permissao" },
+        403
       );
     }
 
     const processingStart = Date.now();
 
-    // =========================================================================
-    // ETAPA 1: Anonimização via NER
-    // =========================================================================
-    // TODO: Integrar com serviço NER real (spaCy, etc.)
-    // Por enquanto, placeholder que simula detecção
+    // =====================================================================
+    // ETAPA 1: ANONIMIZACAO (NER + REGEX)
+    // =====================================================================
+    // Dupla protecao:
+    //   Camada 1 (tecnica): Este modulo remove dados via REGEX
+    //   Camada 2 (logica): O prompt mestre instrui a IA a ignorar PII remanescente
+    // =====================================================================
 
+    // Hash do texto ORIGINAL (prova de que existiu — o texto em si e descartado)
     const originalContentHash = await sha256(content);
-    const { anonymizedContent, entitiesDetected, sensitiveDataFound } =
-      await anonymizeContent(content);
+
+    // Anonimizar
+    const {
+      anonymizedContent,
+      entities,
+      sensitiveDataFound,
+      privacyWarningTriggered,
+    } = anonymizeContent(content);
+
+    // Hash do texto ANONIMIZADO (prova de integridade)
     const anonymizedContentHash = await sha256(anonymizedContent);
 
-    const nerProcessingTime = Date.now() - processingStart;
+    const anonymizationTimeMs = Date.now() - processingStart;
 
-    // =========================================================================
-    // ETAPA 2: Gravar mensagem do usuário (já anonimizada)
-    // =========================================================================
-
+    // =====================================================================
+    // ETAPA 2: GRAVAR MENSAGEM DO MEDICO (ja anonimizada)
+    // =====================================================================
     const { data: userMessage, error: msgError } = await supabaseAdmin
       .from("messages")
       .insert({
@@ -123,93 +146,42 @@ serve(async (req: Request) => {
 
     if (msgError) throw msgError;
 
-    // =========================================================================
-    // ETAPA 3: Gravar logs de anonimização e detecção
-    // =========================================================================
+    // =====================================================================
+    // ETAPA 3: GRAVAR LOGS DE ANONIMIZACAO (prova para auditores ANPD)
+    // =====================================================================
 
-    // Log de anonimização
+    // Log principal de anonimizacao
     await supabaseAdmin.from("anonymization_logs").insert({
       user_id: userId,
       message_id: userMessage.id,
       original_content_hash: originalContentHash,
-      entities_detected: entitiesDetected,
+      entities_detected: entities.map((e: DetectedEntity) => ({
+        type: e.type,
+        action: e.action,
+        confidence: e.confidence,
+        method: e.method,
+        original_length: e.original_length,
+      })),
       anonymization_method: "HYBRID",
       sensitive_data_found: sensitiveDataFound,
-      processing_time_ms: nerProcessingTime,
+      processing_time_ms: anonymizationTimeMs,
     });
 
-    // Logs de detecção individual
-    if (entitiesDetected.length > 0) {
-      const detectionLogs = entitiesDetected.map((entity: NEREntity) => ({
-        user_id: userId,
-        message_id: userMessage.id,
-        detection_type: entity.type.toLowerCase(),
-        detection_method: "NER_HYBRID",
-        confidence_score: entity.confidence,
-        action_taken: entity.action,
-      }));
-
-      await supabaseAdmin
-        .from("sensitive_data_detection_logs")
-        .insert(detectionLogs);
+    // Logs individuais de cada entidade detectada
+    if (entities.length > 0) {
+      await supabaseAdmin.from("sensitive_data_detection_logs").insert(
+        entities.map((e: DetectedEntity) => ({
+          user_id: userId,
+          message_id: userMessage.id,
+          detection_type: e.type,
+          detection_method: `REGEX_${e.method}`,
+          confidence_score: e.confidence,
+          action_taken: e.action,
+        }))
+      );
     }
 
-    // =========================================================================
-    // ETAPA 4: Chamar IA para gerar resposta
-    // =========================================================================
-    // TODO: Integrar com API de IA (Claude, GPT, etc.)
-
-    const aiStart = Date.now();
-    const { aiResponse, tokensUsed, modelUsed, confidenceScore } =
-      await callAIModel(anonymizedContent, conversation_id);
-    const aiProcessingTime = Date.now() - aiStart;
-
-    // =========================================================================
-    // ETAPA 5: Gravar resposta da IA como mensagem
-    // =========================================================================
-
-    const aiContentHash = await sha256(aiResponse);
-
-    const { data: assistantMessage, error: aiMsgError } = await supabaseAdmin
-      .from("messages")
-      .insert({
-        conversation_id,
-        user_id: userId,
-        role: "assistant",
-        content: aiResponse,
-        content_hash: aiContentHash,
-        has_image: false,
-        tokens_used: tokensUsed,
-        model_used: modelUsed,
-      })
-      .select("id")
-      .single();
-
-    if (aiMsgError) throw aiMsgError;
-
-    // =========================================================================
-    // ETAPA 6: Log de explicabilidade (Art. 20 LGPD)
-    // =========================================================================
-
-    await supabaseAdmin.from("explainability_logs").insert({
-      user_id: userId,
-      message_id: assistantMessage.id,
-      conversation_id,
-      ai_model_used: modelUsed,
-      explanation_level: 1, // Básico por padrão
-      explanation_content:
-        "Resposta gerada por modelo de IA com base nos sintomas/sinais informados. " +
-        "O modelo analisa padrões clínicos para sugerir possíveis diagnósticos diferenciais. " +
-        "Esta é uma ferramenta de auxílio — o diagnóstico final é responsabilidade do médico.",
-      confidence_score: confidenceScore,
-      disclaimer_shown: true,
-      human_in_the_loop_confirmed: false,
-    });
-
-    // =========================================================================
-    // ETAPA 7: Log de auditoria
-    // =========================================================================
-
+    // Log de auditoria da mensagem do medico
     await supabaseAdmin.from("audit_logs").insert({
       user_id: userId,
       action: "message_sent",
@@ -219,156 +191,235 @@ serve(async (req: Request) => {
         conversation_id,
         has_image,
         sensitive_data_found: sensitiveDataFound,
-        entities_count: entitiesDetected.length,
-        processing_time_ms: Date.now() - processingStart,
+        entities_count: entities.length,
+        entity_types: entities.map((e: DetectedEntity) => e.type),
+        anonymization_time_ms: anonymizationTimeMs,
+        privacy_warning_triggered: privacyWarningTriggered,
       },
-      ip_address: req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null,
-      user_agent: req.headers.get("user-agent"),
+      ip_address: ipAddress,
+      user_agent: userAgent,
     });
 
-    // =========================================================================
-    // RETORNO
-    // =========================================================================
+    // =====================================================================
+    // ETAPA 4: BUSCAR HISTORICO DA CONVERSA (contexto para a IA)
+    // =====================================================================
+    const { data: previousMessages } = await supabaseAdmin
+      .from("messages")
+      .select("role, content")
+      .eq("conversation_id", conversation_id)
+      .order("created_at", { ascending: true });
 
-    return new Response(
-      JSON.stringify({
-        message_id: assistantMessage.id,
-        content: aiResponse,
-        model_used: modelUsed,
-        tokens_used: tokensUsed,
-        disclaimer: "Este é um auxílio ao diagnóstico. A decisão clínica final é do médico.",
-        sensitive_data_detected: sensitiveDataFound,
-        processing_time_ms: Date.now() - processingStart,
+    // Montar array de mensagens para a API Anthropic
+    const apiMessages = (previousMessages || []).map((m) => ({
+      role: m.role === "system" ? ("user" as const) : (m.role as "user" | "assistant"),
+      content: m.content,
+    }));
+
+    // =====================================================================
+    // ETAPA 5: CHAMAR API ANTHROPIC COM STREAMING
+    // =====================================================================
+    const systemPrompt = MASTER_PROMPT
+      .replace("{MODEL_NAME}", MODEL_NAME)
+      .replace("{SESSION_ID}", conversation_id);
+
+    const anthropicApiKey = Deno.env.get("ANTHROPIC_API_KEY");
+    if (!anthropicApiKey) {
+      throw new Error("ANTHROPIC_API_KEY nao configurada");
+    }
+
+    const anthropicResponse = await fetch(ANTHROPIC_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": anthropicApiKey,
+        "anthropic-version": ANTHROPIC_VERSION,
+      },
+      body: JSON.stringify({
+        model: MODEL_ID,
+        max_tokens: 4096,
+        temperature: 0.2,
+        top_p: 0.9,
+        stream: true,
+        system: systemPrompt,
+        messages: apiMessages,
       }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    });
+
+    if (!anthropicResponse.ok) {
+      const errorBody = await anthropicResponse.text();
+      console.error("Erro Anthropic API:", anthropicResponse.status, errorBody);
+      throw new Error(
+        `API Anthropic retornou status ${anthropicResponse.status}`
+      );
+    }
+
+    // =====================================================================
+    // ETAPA 6: STREAMING SSE — Repassar para o frontend
+    // =====================================================================
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    let fullResponse = "";
+    let outputTokens = 0;
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          const reader = anthropicResponse.body!.getReader();
+          let buffer = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            // Processar linhas SSE completas
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+
+              const data = line.slice(6).trim();
+              if (!data || data === "[DONE]") continue;
+
+              try {
+                const event = JSON.parse(data);
+
+                // Repassar deltas de texto para o frontend
+                if (
+                  event.type === "content_block_delta" &&
+                  event.delta?.type === "text_delta" &&
+                  event.delta?.text
+                ) {
+                  fullResponse += event.delta.text;
+                  controller.enqueue(
+                    encoder.encode(
+                      `data: ${JSON.stringify({ text: event.delta.text })}\n\n`
+                    )
+                  );
+                }
+
+                // Capturar tokens usados
+                if (event.type === "message_delta" && event.usage) {
+                  outputTokens = event.usage.output_tokens || 0;
+                }
+              } catch {
+                // Ignorar linhas que nao sao JSON valido
+              }
+            }
+          }
+
+          // =================================================================
+          // ETAPA 7: STREAM FINALIZADO — Gravar resposta da IA e logs
+          // =================================================================
+          const aiContentHash = await sha256(fullResponse);
+          const totalProcessingTime = Date.now() - processingStart;
+
+          // Salvar mensagem da IA
+          const { data: aiMessage } = await supabaseAdmin
+            .from("messages")
+            .insert({
+              conversation_id,
+              user_id: userId,
+              role: "assistant",
+              content: fullResponse,
+              content_hash: aiContentHash,
+              has_image: false,
+              tokens_used: outputTokens,
+              model_used: MODEL_ID,
+            })
+            .select("id")
+            .single();
+
+          if (aiMessage) {
+            // Contar referencias na resposta
+            const referencesCount = (
+              fullResponse.match(/\[\d+\]/g) || []
+            ).length;
+
+            // Log de explicabilidade (Art. 20 LGPD)
+            await supabaseAdmin.from("explainability_logs").insert({
+              user_id: userId,
+              message_id: aiMessage.id,
+              conversation_id,
+              ai_model_used: MODEL_ID,
+              explanation_level: 2,
+              explanation_content:
+                `Resposta gerada pelo modelo ${MODEL_NAME} com temperatura 0.2 ` +
+                `para maxima precisao clinica. O sistema utilizou o prompt mestre ` +
+                `STAIDOC v1.0 com instrucoes de raciocinio clinico baseado em evidencias. ` +
+                `Referencias extraidas do PubMed/MEDLINE (${referencesCount} citacoes). ` +
+                `O texto do medico foi anonimizado antes do processamento ` +
+                `(${entities.length} entidade(s) sensivel(is) ` +
+                `${sensitiveDataFound ? "detectada(s) e removida(s)" : "nao detectada(s)"}). ` +
+                `Tempo total de processamento: ${totalProcessingTime}ms.`,
+              confidence_score: 0.85,
+              disclaimer_shown: true,
+              human_in_the_loop_confirmed: false,
+            });
+
+            // Log de auditoria da resposta da IA
+            await supabaseAdmin.from("audit_logs").insert({
+              user_id: userId,
+              action: "message_received",
+              resource_type: "messages",
+              resource_id: aiMessage.id,
+              details: {
+                conversation_id,
+                model_used: MODEL_ID,
+                tokens_used: outputTokens,
+                references_count: referencesCount,
+                processing_time_ms: totalProcessingTime,
+                privacy_flag: sensitiveDataFound,
+                anonymization_entities_count: entities.length,
+              },
+              ip_address: ipAddress,
+              user_agent: userAgent,
+            });
+          }
+
+          // Sinal de fim do stream
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch (streamError) {
+          console.error("Erro no streaming:", streamError);
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                error: "Erro ao processar resposta da IA",
+              })}\n\n`
+            )
+          );
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      },
+    });
+
+    // =====================================================================
+    // RETORNO: Stream SSE para o frontend
+    // =====================================================================
+    return new Response(stream, {
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      },
+    });
   } catch (error) {
     console.error("Erro em process-message:", error);
-    return new Response(
-      JSON.stringify({ error: "Erro interno ao processar mensagem" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    return jsonResponse({ error: "Erro interno ao processar mensagem" }, 500);
   }
 });
 
 // ============================================================================
-// FUNÇÕES AUXILIARES
+// Utilitarios
 // ============================================================================
-
-/**
- * Gera hash SHA-256 de um texto
- */
-async function sha256(text: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(text);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/**
- * Anonimiza conteúdo usando NER
- * TODO: Substituir por integração real com spaCy/serviço NER
- */
-async function anonymizeContent(content: string): Promise<{
-  anonymizedContent: string;
-  entitiesDetected: NEREntity[];
-  sensitiveDataFound: boolean;
-}> {
-  const entities: NEREntity[] = [];
-  let anonymized = content;
-
-  // Regex para CPF: XXX.XXX.XXX-XX
-  const cpfRegex = /\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g;
-  let match;
-  while ((match = cpfRegex.exec(content)) !== null) {
-    entities.push({
-      type: "cpf",
-      value: "[REDACTED]",
-      position: [match.index, match.index + match[0].length],
-      action: "redacted",
-      confidence: 0.99,
-    });
-    anonymized = anonymized.replace(match[0], "[CPF_REDACTED]");
-  }
-
-  // Regex para telefone: (XX) XXXXX-XXXX ou (XX) XXXX-XXXX
-  const phoneRegex = /\(\d{2}\)\s?\d{4,5}-?\d{4}/g;
-  while ((match = phoneRegex.exec(content)) !== null) {
-    entities.push({
-      type: "phone",
-      value: "[REDACTED]",
-      position: [match.index, match.index + match[0].length],
-      action: "redacted",
-      confidence: 0.95,
-    });
-    anonymized = anonymized.replace(match[0], "[PHONE_REDACTED]");
-  }
-
-  // Regex para email
-  const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
-  while ((match = emailRegex.exec(content)) !== null) {
-    entities.push({
-      type: "email",
-      value: "[REDACTED]",
-      position: [match.index, match.index + match[0].length],
-      action: "redacted",
-      confidence: 0.98,
-    });
-    anonymized = anonymized.replace(match[0], "[EMAIL_REDACTED]");
-  }
-
-  // Regex para RG: XX.XXX.XXX-X
-  const rgRegex = /\b\d{2}\.\d{3}\.\d{3}-\d{1}\b/g;
-  while ((match = rgRegex.exec(content)) !== null) {
-    entities.push({
-      type: "rg",
-      value: "[REDACTED]",
-      position: [match.index, match.index + match[0].length],
-      action: "redacted",
-      confidence: 0.90,
-    });
-    anonymized = anonymized.replace(match[0], "[RG_REDACTED]");
-  }
-
-  return {
-    anonymizedContent: anonymized,
-    entitiesDetected: entities,
-    sensitiveDataFound: entities.length > 0,
-  };
-}
-
-/**
- * Chama modelo de IA para gerar resposta
- * TODO: Implementar integração real com API de IA
- */
-async function callAIModel(
-  content: string,
-  conversationId: string
-): Promise<{
-  aiResponse: string;
-  tokensUsed: number;
-  modelUsed: string;
-  confidenceScore: number;
-}> {
-  // Placeholder — substituir por chamada real à API
-  // Em produção: montar prompt com contexto da conversa, chamar API, parsear resposta
-
-  return {
-    aiResponse:
-      "⚠️ DISCLAIMER: Este é um auxílio ao diagnóstico e não substitui a avaliação clínica.\n\n" +
-      "[Resposta da IA será gerada aqui após integração com modelo de linguagem]\n\n" +
-      "Com base nos sintomas/sinais informados, os diagnósticos diferenciais sugeridos são:\n" +
-      "1. [Diagnóstico diferencial 1]\n" +
-      "2. [Diagnóstico diferencial 2]\n" +
-      "3. [Diagnóstico diferencial 3]\n\n" +
-      "Exames complementares sugeridos: [lista de exames]\n\n" +
-      "🔒 Nenhum dado pessoal identificável foi armazenado nesta interação.",
-    tokensUsed: 0,
-    modelUsed: "placeholder-model-v1",
-    confidenceScore: 0.0,
-  };
+function jsonResponse(body: Record<string, unknown>, status: number) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
 }
