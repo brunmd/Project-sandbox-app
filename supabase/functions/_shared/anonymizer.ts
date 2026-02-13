@@ -1,16 +1,20 @@
 // ============================================================================
-// StaiDOC — Módulo de Anonimização (NER + REGEX)
-// Camada de proteção ANTES do texto ir para a API da Anthropic
+// StaiDOC — Modulo de Anonimizacao (NER + REGEX) v2 — Security Hardened
+// Camada de protecao ANTES do texto ir para a API da Anthropic
 // ============================================================================
-// Dupla proteção:
-//   1. Este módulo remove dados sensíveis via REGEX (camada técnica)
-//   2. O prompt mestre instrui a IA a ignorar qualquer PII remanescente (camada lógica)
+// Dupla protecao:
+//   1. Este modulo remove dados sensiveis via REGEX (camada tecnica)
+//   2. O prompt mestre instrui a IA a ignorar qualquer PII remanescente (camada logica)
+// ============================================================================
+// Melhorias v2:
+//   - Contexto medico: evita falsos positivos com dados clinicos
+//   - Posicoes calculadas no texto ORIGINAL (nao no modificado)
+//   - Deteccao de CPF sem formatacao (11 digitos consecutivos)
 // ============================================================================
 
 export interface DetectedEntity {
   type: "cpf" | "phone" | "email" | "rg" | "name" | "address";
   original_length: number;
-  position: [number, number];
   action: "redacted";
   confidence: number;
   method: string;
@@ -23,179 +27,289 @@ export interface AnonymizationResult {
   privacyWarningTriggered: boolean;
 }
 
+// ============================================================================
+// REGEX patterns
+// ============================================================================
+
 // CPF: 000.000.000-00 ou 00000000000
 const CPF_REGEX = /\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g;
 
-// Telefone: (00) 00000-0000 ou (00) 0000-0000 ou variações
+// Telefone: (00) 00000-0000 ou (00) 0000-0000 ou variacoes
 const PHONE_REGEX = /(?:\+55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}-?\d{4}/g;
 
 // Email
 const EMAIL_REGEX = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 
-// RG: 00.000.000-0 ou variações
+// RG: 00.000.000-0 ou variacoes
 const RG_REGEX = /\b\d{1,2}\.?\d{3}\.?\d{3}-?[\dXx]\b/g;
 
 // CEP: 00000-000 ou 00000000
 const CEP_REGEX = /\b\d{5}-?\d{3}\b/g;
 
-// Endereços: padrões com Rua, Av., Alameda, etc.
+// Enderecos: padroes com Rua, Av., Alameda, etc.
 const ADDRESS_REGEX =
-  /\b(?:Rua|Avenida|Av\.|Alameda|Al\.|Travessa|Tv\.|Praça|Pça\.|Rodovia|Rod\.|Estrada|Est\.)\s+[A-Za-zÀ-ÿ\s]+(?:,\s*(?:n[°ºo]?\s*)?\d+)?(?:\s*[-,]\s*(?:apto?|apartamento|sala|bloco|conj\.?)\s*\d+)?/gi;
+  /\b(?:Rua|Avenida|Av\.|Alameda|Al\.|Travessa|Tv\.|Praca|Pca\.|Rodovia|Rod\.|Estrada|Est\.)\s+[A-Za-z\u00C0-\u00FF\s]+(?:,\s*(?:n[\u00B0\u00BAo]?\s*)?\d+)?(?:\s*[-,]\s*(?:apto?|apartamento|sala|bloco|conj\.?)\s*\d+)?/gi;
 
-// Prontuário: variações de número de prontuário/registro
+// Prontuario: variacoes de numero de prontuario/registro
 const PRONTUARIO_REGEX =
-  /(?:prontu[aá]rio|registro|matr[ií]cula|n[°ºo]?\s*(?:do\s+)?(?:prontu[aá]rio|registro))[\s:]*\d+/gi;
+  /(?:prontu[a\u00E1]rio|registro|matr[i\u00ED]cula|n[\u00B0\u00BAo]?\s*(?:do\s+)?(?:prontu[a\u00E1]rio|registro))[\s:]*\d+/gi;
 
-// Nomes após indicadores: "paciente Maria", "Sr. João", etc.
+// Nomes apos indicadores: "paciente Maria", "Sr. Joao", etc.
 const NAME_INDICATOR_REGEX =
-  /(?:(?:paciente|sr\.?a?|dr\.?a?|nome|chamad[ao])\s+)([A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+(?:d[aeo]s?\s+)?[A-ZÀ-Ÿ][a-zà-ÿ]+){1,5})/gi;
+  /(?:(?:paciente|sr\.?a?|dr\.?a?|nome|chamad[ao])\s+)([A-Z\u00C0-\u0178][a-z\u00E0-\u00FF]+(?:\s+(?:d[aeo]s?\s+)?[A-Z\u00C0-\u0178][a-z\u00E0-\u00FF]+){1,5})/gi;
+
+// ============================================================================
+// Contexto medico: padroes que NAO devem ser anonimizados
+// ============================================================================
+// Previne falsos positivos com dados clinicos como pressao arterial,
+// frequencia cardiaca, temperatura, saturacao, glicemia, etc.
+const MEDICAL_CONTEXT_PATTERNS = [
+  /(?:press[a\u00E3]o|pa|pas|pad)\s*[:=]?\s*\d/i,
+  /(?:fc|frequencia|frequ[e\u00EA]ncia)\s*[:=]?\s*\d/i,
+  /(?:temperatura|temp)\s*[:=]?\s*\d/i,
+  /(?:satura[c\u00E7][a\u00E3]o|spo2|sat)\s*[:=]?\s*\d/i,
+  /(?:glicemia|hgt|dextro)\s*[:=]?\s*\d/i,
+  /(?:hemoglobina|hb|hg)\s*[:=]?\s*\d/i,
+  /(?:creatinina|cr)\s*[:=]?\s*\d/i,
+  /(?:ureia|ur)\s*[:=]?\s*\d/i,
+  /(?:leucocitos|leuco)\s*[:=]?\s*\d/i,
+  /(?:plaquetas|plaq)\s*[:=]?\s*\d/i,
+  /(?:inr|tp|ttpa)\s*[:=]?\s*\d/i,
+  /\d+\s*(?:mg|ml|mcg|ui|mmhg|bpm|rpm|kg|cm|mm|g\/dl|mg\/dl|meq|mmol)/i,
+];
 
 /**
- * Anonimiza o conteúdo removendo dados pessoais identificáveis.
- * Retorna o texto limpo e os metadados de detecção para os logs.
+ * Verifica se uma posicao no texto esta dentro de contexto medico.
+ * Se estiver, o match nao deve ser anonimizado (falso positivo).
+ */
+function isInMedicalContext(content: string, matchStart: number): boolean {
+  // Analisar 40 caracteres antes e 20 depois do match
+  const contextBefore = content.slice(Math.max(0, matchStart - 40), matchStart);
+  const contextAfter = content.slice(matchStart, matchStart + 20);
+  const context = contextBefore + contextAfter;
+
+  return MEDICAL_CONTEXT_PATTERNS.some((pattern) => pattern.test(context));
+}
+
+// ============================================================================
+// Tipos para coleta antes da substituicao
+// ============================================================================
+interface PendingRedaction {
+  start: number;
+  end: number;
+  replacement: string;
+  entity: DetectedEntity;
+}
+
+/**
+ * Anonimiza o conteudo removendo dados pessoais identificaveis.
+ * Retorna o texto limpo e os metadados de deteccao para os logs.
+ *
+ * v2: Coleta todos os matches primeiro, depois aplica substituicoes
+ *     de tras para frente para manter posicoes corretas.
  */
 export function anonymizeContent(content: string): AnonymizationResult {
-  const entities: DetectedEntity[] = [];
-  let anonymized = content;
+  const redactions: PendingRedaction[] = [];
   let privacyWarningTriggered = false;
 
-  // Ordem de processamento: mais específicos primeiro para evitar conflitos
+  // ========================================================================
+  // FASE 1: Coletar todos os matches (sem modificar o texto)
+  // ========================================================================
 
   // 1. CPF
-  anonymized = anonymized.replace(CPF_REGEX, (match, offset) => {
-    // Verificar se é realmente um CPF (11 dígitos) e não um número qualquer
-    const digits = match.replace(/\D/g, "");
-    if (digits.length === 11) {
-      entities.push({
-        type: "cpf",
-        original_length: match.length,
-        position: [offset, offset + match.length],
-        action: "redacted",
-        confidence: 0.98,
-        method: "REGEX",
+  for (const match of content.matchAll(CPF_REGEX)) {
+    const digits = match[0].replace(/\D/g, "");
+    if (digits.length === 11 && match.index !== undefined) {
+      redactions.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        replacement: "[CPF REMOVIDO]",
+        entity: {
+          type: "cpf",
+          original_length: match[0].length,
+          action: "redacted",
+          confidence: 0.98,
+          method: "REGEX",
+        },
       });
-      privacyWarningTriggered = true;
-      return "[CPF REMOVIDO]";
     }
-    return match;
-  });
+  }
 
   // 2. Email
-  anonymized = anonymized.replace(EMAIL_REGEX, (match, offset) => {
-    entities.push({
-      type: "email",
-      original_length: match.length,
-      position: [offset, offset + match.length],
-      action: "redacted",
-      confidence: 0.97,
-      method: "REGEX",
-    });
+  for (const match of content.matchAll(EMAIL_REGEX)) {
+    if (match.index !== undefined) {
+      redactions.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        replacement: "[EMAIL REMOVIDO]",
+        entity: {
+          type: "email",
+          original_length: match[0].length,
+          action: "redacted",
+          confidence: 0.97,
+          method: "REGEX",
+        },
+      });
+    }
+  }
+
+  // 3. Telefone (com verificacao de contexto medico)
+  for (const match of content.matchAll(PHONE_REGEX)) {
+    const digits = match[0].replace(/\D/g, "");
+    if (
+      digits.length >= 10 &&
+      digits.length <= 13 &&
+      match.index !== undefined &&
+      !isInMedicalContext(content, match.index)
+    ) {
+      redactions.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        replacement: "[TELEFONE REMOVIDO]",
+        entity: {
+          type: "phone",
+          original_length: match[0].length,
+          action: "redacted",
+          confidence: 0.93,
+          method: "REGEX",
+        },
+      });
+    }
+  }
+
+  // 4. RG (com verificacao de contexto medico)
+  for (const match of content.matchAll(RG_REGEX)) {
+    const digits = match[0].replace(/\D/g, "");
+    if (
+      digits.length >= 7 &&
+      digits.length <= 9 &&
+      match.index !== undefined &&
+      !isInMedicalContext(content, match.index)
+    ) {
+      redactions.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        replacement: "[RG REMOVIDO]",
+        entity: {
+          type: "rg",
+          original_length: match[0].length,
+          action: "redacted",
+          confidence: 0.85,
+          method: "REGEX",
+        },
+      });
+    }
+  }
+
+  // 5. Enderecos
+  for (const match of content.matchAll(ADDRESS_REGEX)) {
+    if (match.index !== undefined) {
+      redactions.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        replacement: "[ENDERECO REMOVIDO]",
+        entity: {
+          type: "address",
+          original_length: match[0].length,
+          action: "redacted",
+          confidence: 0.88,
+          method: "REGEX",
+        },
+      });
+    }
+  }
+
+  // 6. CEP (com verificacao de contexto medico)
+  for (const match of content.matchAll(CEP_REGEX)) {
+    const digits = match[0].replace(/\D/g, "");
+    if (
+      digits.length === 8 &&
+      match.index !== undefined &&
+      !isInMedicalContext(content, match.index)
+    ) {
+      redactions.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        replacement: "[CEP REMOVIDO]",
+        entity: {
+          type: "address",
+          original_length: match[0].length,
+          action: "redacted",
+          confidence: 0.90,
+          method: "REGEX",
+        },
+      });
+    }
+  }
+
+  // 7. Prontuario
+  for (const match of content.matchAll(PRONTUARIO_REGEX)) {
+    if (match.index !== undefined) {
+      redactions.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        replacement: "[PRONTUARIO REMOVIDO]",
+        entity: {
+          type: "name",
+          original_length: match[0].length,
+          action: "redacted",
+          confidence: 0.92,
+          method: "REGEX",
+        },
+      });
+    }
+  }
+
+  // 8. Nomes apos indicadores
+  for (const match of content.matchAll(NAME_INDICATOR_REGEX)) {
+    if (match.index !== undefined && match[1]) {
+      const fullMatch = match[0];
+      const name = match[1];
+      const indicator = fullMatch.slice(0, fullMatch.length - name.length);
+      redactions.push({
+        start: match.index,
+        end: match.index + fullMatch.length,
+        replacement: `${indicator}[NOME REMOVIDO]`,
+        entity: {
+          type: "name",
+          original_length: name.length,
+          action: "redacted",
+          confidence: 0.80,
+          method: "REGEX_CONTEXTUAL",
+        },
+      });
+    }
+  }
+
+  // ========================================================================
+  // FASE 2: Remover sobreposicoes (manter o match mais especifico)
+  // ========================================================================
+  redactions.sort((a, b) => a.start - b.start);
+  const filtered: PendingRedaction[] = [];
+  let lastEnd = -1;
+
+  for (const r of redactions) {
+    if (r.start >= lastEnd) {
+      filtered.push(r);
+      lastEnd = r.end;
+    }
+    // Se sobrepoe, descarta (o anterior, mais especifico, ja foi adicionado)
+  }
+
+  // ========================================================================
+  // FASE 3: Aplicar substituicoes de tras para frente (preserva posicoes)
+  // ========================================================================
+  let anonymized = content;
+  const entities: DetectedEntity[] = [];
+
+  // Processar de tras para frente para nao invalidar offsets
+  for (let i = filtered.length - 1; i >= 0; i--) {
+    const r = filtered[i];
+    anonymized =
+      anonymized.slice(0, r.start) + r.replacement + anonymized.slice(r.end);
+    entities.unshift(r.entity); // unshift para manter ordem original
     privacyWarningTriggered = true;
-    return "[EMAIL REMOVIDO]";
-  });
-
-  // 3. Telefone
-  anonymized = anonymized.replace(PHONE_REGEX, (match, offset) => {
-    const digits = match.replace(/\D/g, "");
-    if (digits.length >= 10 && digits.length <= 13) {
-      entities.push({
-        type: "phone",
-        original_length: match.length,
-        position: [offset, offset + match.length],
-        action: "redacted",
-        confidence: 0.93,
-        method: "REGEX",
-      });
-      privacyWarningTriggered = true;
-      return "[TELEFONE REMOVIDO]";
-    }
-    return match;
-  });
-
-  // 4. RG
-  anonymized = anonymized.replace(RG_REGEX, (match, offset) => {
-    const digits = match.replace(/\D/g, "");
-    // RG tem entre 7 e 9 dígitos (varia por estado)
-    // Evitar falso positivo com números clínicos curtos
-    if (digits.length >= 7 && digits.length <= 9) {
-      entities.push({
-        type: "rg",
-        original_length: match.length,
-        position: [offset, offset + match.length],
-        action: "redacted",
-        confidence: 0.85,
-        method: "REGEX",
-      });
-      privacyWarningTriggered = true;
-      return "[RG REMOVIDO]";
-    }
-    return match;
-  });
-
-  // 5. Endereços (Rua, Av., etc.)
-  anonymized = anonymized.replace(ADDRESS_REGEX, (match, offset) => {
-    entities.push({
-      type: "address",
-      original_length: match.length,
-      position: [offset, offset + match.length],
-      action: "redacted",
-      confidence: 0.88,
-      method: "REGEX",
-    });
-    privacyWarningTriggered = true;
-    return "[ENDERECO REMOVIDO]";
-  });
-
-  // 6. CEP
-  anonymized = anonymized.replace(CEP_REGEX, (match, offset) => {
-    const digits = match.replace(/\D/g, "");
-    if (digits.length === 8) {
-      entities.push({
-        type: "address",
-        original_length: match.length,
-        position: [offset, offset + match.length],
-        action: "redacted",
-        confidence: 0.90,
-        method: "REGEX",
-      });
-      privacyWarningTriggered = true;
-      return "[CEP REMOVIDO]";
-    }
-    return match;
-  });
-
-  // 7. Prontuário
-  anonymized = anonymized.replace(PRONTUARIO_REGEX, (match, offset) => {
-    entities.push({
-      type: "name",
-      original_length: match.length,
-      position: [offset, offset + match.length],
-      action: "redacted",
-      confidence: 0.92,
-      method: "REGEX",
-    });
-    privacyWarningTriggered = true;
-    return "[PRONTUARIO REMOVIDO]";
-  });
-
-  // 8. Nomes após indicadores (paciente X, Sr. Y, etc.)
-  anonymized = anonymized.replace(
-    NAME_INDICATOR_REGEX,
-    (match, name, offset) => {
-      entities.push({
-        type: "name",
-        original_length: name.length,
-        position: [offset, offset + match.length],
-        action: "redacted",
-        confidence: 0.80,
-        method: "REGEX_CONTEXTUAL",
-      });
-      privacyWarningTriggered = true;
-      // Preservar o indicador, remover o nome
-      const indicator = match.slice(0, match.length - name.length);
-      return `${indicator}[NOME REMOVIDO]`;
-    }
-  );
+  }
 
   return {
     anonymizedContent: anonymized,
