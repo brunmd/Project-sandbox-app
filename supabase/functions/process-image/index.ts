@@ -1,19 +1,22 @@
 // ============================================================================
-// StaiDOC — Edge Function: process-image
-// Recebe imagem → gera hash → envia para IA → descarta imagem → grava log
+// StaiDOC — Edge Function: process-image (v2 — Security Hardened)
+// Recebe imagem → valida magic bytes → gera hash → envia para IA →
+// descarta imagem com wipe seguro → grava log
 // ============================================================================
-// IMPORTANTE: A imagem NUNCA é armazenada. É processada em memória e descartada.
+// IMPORTANTE: A imagem NUNCA e armazenada. E processada em memoria e descartada.
 // O log comprova que a imagem existiu, foi processada e foi descartada.
 // ============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-};
+import { getCorsHeaders } from "../_shared/cors.ts";
+import { sha256Buffer } from "../_shared/anonymizer.ts";
+import {
+  isValidUUID,
+  isValidAuthHeader,
+  detectImageMimeType,
+  secureWipeBuffer,
+} from "../_shared/validation.ts";
 
 const ALLOWED_MIME_TYPES = [
   "image/jpeg",
@@ -22,21 +25,23 @@ const ALLOWED_MIME_TYPES = [
   "image/heic",
   "image/heif",
 ];
-const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB (reduzido de 10MB para seguranca)
+const ALLOWED_PURPOSES = ["diagnostic_aid", "clinical_image"];
 
 serve(async (req: Request) => {
+  const cors = getCorsHeaders(req);
+
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+    return new Response("ok", { headers: cors });
   }
 
+  let imageBuffer: ArrayBuffer | null = null;
+
   try {
-    // Autenticação
+    // Autenticacao
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return new Response(
-        JSON.stringify({ error: "Token de autenticação ausente" }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+    if (!authHeader || !isValidAuthHeader(authHeader)) {
+      return errorResponse(cors, "Token de autenticacao ausente ou invalido", 401);
     }
 
     const supabaseAdmin = createClient(
@@ -50,17 +55,17 @@ serve(async (req: Request) => {
       { global: { headers: { Authorization: authHeader } } }
     );
 
-    const { data: { user }, error: authError } = await supabaseUser.auth.getUser();
+    const {
+      data: { user },
+      error: authError,
+    } = await supabaseUser.auth.getUser();
     if (authError || !user) {
-      return new Response(
-        JSON.stringify({ error: "Usuário não autenticado" }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return errorResponse(cors, "Usuario nao autenticado", 401);
     }
 
     const userId = user.id;
 
-    // Ler FormData (imagem + metadados)
+    // Ler FormData
     const formData = await req.formData();
     const imageFile = formData.get("image") as File | null;
     const conversationId = formData.get("conversation_id") as string;
@@ -68,34 +73,32 @@ serve(async (req: Request) => {
     const purpose = (formData.get("purpose") as string) || "diagnostic_aid";
 
     if (!imageFile || !conversationId) {
-      return new Response(
-        JSON.stringify({ error: "image e conversation_id são obrigatórios" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return errorResponse(cors, "image e conversation_id sao obrigatorios", 400);
     }
 
-    // Validar tipo MIME
-    if (!ALLOWED_MIME_TYPES.includes(imageFile.type)) {
-      return new Response(
-        JSON.stringify({
-          error: `Tipo de imagem não permitido: ${imageFile.type}`,
-          allowed: ALLOWED_MIME_TYPES,
-        }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+    // Validar UUID
+    if (!isValidUUID(conversationId)) {
+      return errorResponse(cors, "Formato de conversation_id invalido", 400);
+    }
+    if (messageId && !isValidUUID(messageId)) {
+      return errorResponse(cors, "Formato de message_id invalido", 400);
+    }
+
+    // Validar purpose
+    if (!ALLOWED_PURPOSES.includes(purpose)) {
+      return errorResponse(cors, "Tipo de proposito invalido", 400);
     }
 
     // Validar tamanho
     if (imageFile.size > MAX_IMAGE_SIZE) {
-      return new Response(
-        JSON.stringify({
-          error: `Imagem excede o tamanho máximo de ${MAX_IMAGE_SIZE / 1024 / 1024}MB`,
-        }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      return errorResponse(
+        cors,
+        `Imagem excede o tamanho maximo de ${MAX_IMAGE_SIZE / 1024 / 1024}MB`,
+        413
       );
     }
 
-    // Verificar que a conversa pertence ao usuário
+    // Verificar que a conversa pertence ao usuario (via RLS)
     const { data: conversation, error: convError } = await supabaseUser
       .from("conversations")
       .select("id")
@@ -103,154 +106,147 @@ serve(async (req: Request) => {
       .single();
 
     if (convError || !conversation) {
-      return new Response(
-        JSON.stringify({ error: "Conversa não encontrada ou sem permissão" }),
-        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return errorResponse(cors, "Conversa nao encontrada ou sem permissao", 403);
     }
 
     const processedAt = new Date().toISOString();
     const processingStart = Date.now();
 
     // =========================================================================
-    // ETAPA 1: Ler imagem em memória e gerar hash
+    // ETAPA 1: Ler imagem em memoria e validar magic bytes
     // =========================================================================
+    imageBuffer = await imageFile.arrayBuffer();
 
-    const imageBuffer = await imageFile.arrayBuffer();
+    // Validar tipo real da imagem pelos magic bytes (previne spoofing de MIME)
+    const detectedMime = detectImageMimeType(imageBuffer);
+    if (!detectedMime || !ALLOWED_MIME_TYPES.includes(detectedMime)) {
+      secureWipeBuffer(imageBuffer);
+      return errorResponse(
+        cors,
+        "Arquivo nao e uma imagem valida (validacao de magic bytes falhou)",
+        400
+      );
+    }
+
     const imageHash = await sha256Buffer(imageBuffer);
 
     // =========================================================================
-    // ETAPA 2: Enviar para IA processar (em memória)
+    // ETAPA 2: Enviar para IA processar (em memoria)
     // =========================================================================
-    // TODO: Integrar com API de IA que aceita imagens (GPT-4V, Claude Vision, etc.)
-
     const { aiResult, modelUsed } = await processImageWithAI(
       imageBuffer,
-      imageFile.type,
+      detectedMime,
       purpose
     );
 
     // =========================================================================
-    // ETAPA 3: DESCARTAR imagem da memória
+    // ETAPA 3: DESCARTAR imagem com wipe seguro
     // =========================================================================
-    // O ArrayBuffer sai de escopo e será coletado pelo GC.
-    // Marcamos o momento exato do descarte.
+    secureWipeBuffer(imageBuffer);
+    imageBuffer = null;
     const discardedAt = new Date().toISOString();
     const processingDuration = Date.now() - processingStart;
 
     // =========================================================================
-    // ETAPA 4: Gravar log de processamento (prova de descarte)
+    // ETAPA 4: Gravar logs em paralelo (prova de descarte)
     // =========================================================================
+    const ipAddress =
+      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
+    const userAgent = req.headers.get("user-agent") || null;
 
-    await supabaseAdmin.from("image_processing_logs").insert({
-      user_id: userId,
-      conversation_id: conversationId,
-      message_id: messageId,
-      image_hash: imageHash,
-      image_size_bytes: imageFile.size,
-      image_mime_type: imageFile.type,
-      purpose,
-      processed_at: processedAt,
-      discarded_at: discardedAt,
-      processing_duration_ms: processingDuration,
-      ai_model_used: modelUsed,
-      storage_proof: "processed_in_memory",
-    });
-
-    // =========================================================================
-    // ETAPA 5: Log de auditoria
-    // =========================================================================
-
-    await supabaseAdmin.from("audit_logs").insert({
-      user_id: userId,
-      action: "image_processed",
-      resource_type: "image_processing_logs",
-      resource_id: null,
-      details: {
+    await Promise.allSettled([
+      supabaseAdmin.from("image_processing_logs").insert({
+        user_id: userId,
         conversation_id: conversationId,
+        message_id: messageId,
         image_hash: imageHash,
         image_size_bytes: imageFile.size,
-        image_mime_type: imageFile.type,
+        image_mime_type: detectedMime,
         purpose,
-        processing_duration_ms: processingDuration,
-        storage_proof: "processed_in_memory",
-      },
-      ip_address: req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null,
-      user_agent: req.headers.get("user-agent"),
-    });
-
-    // Segundo log para o descarte
-    await supabaseAdmin.from("audit_logs").insert({
-      user_id: userId,
-      action: "image_discarded",
-      resource_type: "image_processing_logs",
-      resource_id: null,
-      details: {
-        image_hash: imageHash,
+        processed_at: processedAt,
         discarded_at: discardedAt,
+        processing_duration_ms: processingDuration,
+        ai_model_used: modelUsed,
         storage_proof: "processed_in_memory",
-      },
-    });
+      }),
+      supabaseAdmin.from("audit_logs").insert({
+        user_id: userId,
+        action: "image_processed",
+        resource_type: "image_processing_logs",
+        resource_id: null,
+        details: {
+          conversation_id: conversationId,
+          image_size_bytes: imageFile.size,
+          image_mime_type: detectedMime,
+          purpose,
+          processing_duration_ms: processingDuration,
+          storage_proof: "processed_in_memory",
+          discarded_at: discardedAt,
+        },
+        ip_address: ipAddress,
+        user_agent: userAgent,
+      }),
+    ]);
 
     // =========================================================================
     // RETORNO
     // =========================================================================
-
     return new Response(
       JSON.stringify({
         success: true,
         ai_result: aiResult,
         model_used: modelUsed,
-        image_hash: imageHash,
         processing_duration_ms: processingDuration,
         storage_proof: "processed_in_memory",
         discarded_at: discardedAt,
         disclaimer:
-          "A imagem foi processada em memória e descartada imediatamente. " +
-          "Nenhuma cópia foi armazenada. O hash SHA-256 comprova sua existência.",
+          "A imagem foi processada em memoria e descartada imediatamente. " +
+          "Nenhuma copia foi armazenada.",
       }),
       {
         status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: { ...cors, "Content-Type": "application/json" },
       }
     );
   } catch (error) {
+    // Garantir wipe seguro mesmo em caso de erro
+    if (imageBuffer) {
+      secureWipeBuffer(imageBuffer);
+    }
     console.error("Erro em process-image:", error);
-    return new Response(
-      JSON.stringify({ error: "Erro interno ao processar imagem" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    return errorResponse(getCorsHeaders(req), "Erro interno ao processar imagem", 500);
   }
 });
 
 // ============================================================================
-// FUNÇÕES AUXILIARES
+// FUNCOES AUXILIARES
 // ============================================================================
 
-/**
- * Gera hash SHA-256 de um ArrayBuffer
- */
-async function sha256Buffer(buffer: ArrayBuffer): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+function errorResponse(
+  cors: Record<string, string>,
+  message: string,
+  status: number
+) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { ...cors, "Content-Type": "application/json" },
+  });
 }
 
 /**
- * Processa imagem com IA
- * TODO: Implementar integração real com API de visão (Claude Vision, GPT-4V, etc.)
+ * Processa imagem com IA (Claude Vision)
+ * TODO: Implementar integracao real com API Anthropic Vision
  */
 async function processImageWithAI(
   _imageBuffer: ArrayBuffer,
   _mimeType: string,
   _purpose: string
 ): Promise<{ aiResult: string; modelUsed: string }> {
-  // Placeholder — substituir por chamada real à API de visão
   return {
     aiResult:
-      "⚠️ DISCLAIMER: Análise de imagem como auxílio diagnóstico. Não substitui avaliação clínica.\n\n" +
-      "[Resultado da análise de imagem será gerado aqui após integração com modelo de visão]\n\n" +
-      "🔒 A imagem foi processada em memória e descartada imediatamente.",
+      "DISCLAIMER: Analise de imagem como auxilio diagnostico. Nao substitui avaliacao clinica.\n\n" +
+      "[Resultado da analise de imagem sera gerado aqui apos integracao com modelo de visao]\n\n" +
+      "A imagem foi processada em memoria e descartada imediatamente.",
     modelUsed: "placeholder-vision-v1",
   };
 }

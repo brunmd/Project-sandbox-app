@@ -1,28 +1,33 @@
 // ============================================================================
-// StaiDOC — Edge Function: log-access
+// StaiDOC — Edge Function: log-access (v2 — Security Hardened)
 // Chamada no login/logout para gravar access_logs
 // ============================================================================
-// Conformidade: Marco Civil da Internet (Art. 15) — retenção mínima 6 meses
+// Conformidade: Marco Civil da Internet (Art. 15) — retencao minima 6 meses
 // ============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { getCorsHeaders } from "../_shared/cors.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+const VALID_ACTIONS = ["login", "logout", "session_refresh", "failed_login"];
+const AUDIT_ACTION_MAP: Record<string, string> = {
+  login: "login",
+  logout: "logout",
+  session_refresh: "login",
+  failed_login: "login",
 };
 
 interface LogAccessRequest {
-  action: "login" | "logout" | "session_refresh" | "failed_login";
+  action: string;
   session_duration_seconds?: number;
   failure_reason?: string;
 }
 
 serve(async (req: Request) => {
+  const cors = getCorsHeaders(req);
+
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+    return new Response("ok", { headers: cors });
   }
 
   try {
@@ -33,9 +38,16 @@ serve(async (req: Request) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    // Para failed_login, o usuário pode não estar autenticado
-    const { action, session_duration_seconds, failure_reason } =
-      await req.json() as LogAccessRequest;
+    const body = (await req.json()) as LogAccessRequest;
+    const { action, session_duration_seconds, failure_reason } = body;
+
+    // Validar action (previne log poisoning)
+    if (!action || !VALID_ACTIONS.includes(action)) {
+      return new Response(
+        JSON.stringify({ error: "Acao invalida" }),
+        { status: 400, headers: { ...cors, "Content-Type": "application/json" } }
+      );
+    }
 
     let userId: string | null = null;
     let success = true;
@@ -47,77 +59,65 @@ serve(async (req: Request) => {
         { global: { headers: { Authorization: authHeader } } }
       );
 
-      const { data: { user } } = await supabaseUser.auth.getUser();
+      const {
+        data: { user },
+      } = await supabaseUser.auth.getUser();
       userId = user?.id ?? null;
     }
 
-    // Para failed_login, não temos user_id
     if (action === "failed_login") {
       success = false;
     }
 
-    // Extrair informações do request
+    // Extrair informacoes do request
     const ipAddress =
       req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
       req.headers.get("x-real-ip") ||
       null;
-    const userAgent = req.headers.get("user-agent");
-
-    // Geolocalização básica (placeholder — usar serviço de GeoIP em produção)
-    const geoLocation = ipAddress
-      ? { ip: ipAddress, note: "GeoIP lookup pendente" }
-      : {};
+    const userAgent = req.headers.get("user-agent") || null;
 
     // =========================================================================
-    // Gravar access_log
+    // Gravar access_log e audit_log em paralelo
     // =========================================================================
-
-    const { error: logError } = await supabaseAdmin.from("access_logs").insert({
-      user_id: userId,
-      action,
-      ip_address: ipAddress,
-      user_agent: userAgent,
-      geo_location: geoLocation,
-      session_duration_seconds: session_duration_seconds ?? null,
-      success,
-      failure_reason: failure_reason ?? null,
-    });
-
-    if (logError) throw logError;
-
-    // =========================================================================
-    // Gravar audit_log correspondente
-    // =========================================================================
-
-    const auditAction = action === "login" ? "login" : action === "logout" ? "logout" : action;
-
-    await supabaseAdmin.from("audit_logs").insert({
-      user_id: userId,
-      action: auditAction === "login" || auditAction === "logout" ? auditAction : "login",
-      resource_type: "access_logs",
-      resource_id: null,
-      details: {
-        access_action: action,
+    await Promise.allSettled([
+      supabaseAdmin.from("access_logs").insert({
+        user_id: userId,
+        action,
+        ip_address: ipAddress,
+        user_agent: userAgent,
+        geo_location: {},
+        session_duration_seconds: session_duration_seconds ?? null,
         success,
         failure_reason: failure_reason ?? null,
-        session_duration_seconds: session_duration_seconds ?? null,
-      },
-      ip_address: ipAddress,
-      user_agent: userAgent,
-    });
+      }),
+      supabaseAdmin.from("audit_logs").insert({
+        user_id: userId,
+        action: AUDIT_ACTION_MAP[action] || "login",
+        resource_type: "access_logs",
+        resource_id: null,
+        details: {
+          access_action: action,
+          success,
+          failure_reason: failure_reason ?? null,
+          session_duration_seconds: session_duration_seconds ?? null,
+        },
+        ip_address: ipAddress,
+        user_agent: userAgent,
+      }),
+    ]);
 
     return new Response(
       JSON.stringify({ success: true, action, logged_at: new Date().toISOString() }),
       {
         status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: { ...cors, "Content-Type": "application/json" },
       }
     );
   } catch (error) {
     console.error("Erro em log-access:", error);
     return new Response(
       JSON.stringify({ error: "Erro interno ao registrar acesso" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      { status: 500, headers: { ...getCorsHeaders(req), "Content-Type": "application/json" } }
     );
   }
 });

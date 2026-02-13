@@ -1,20 +1,29 @@
 // ============================================================================
-// StaiDOC — Edge Function: process-message
-// Fluxo: Recebe mensagem → Anonimiza (NER+REGEX) → Grava logs → Chama
-//        API Anthropic (Claude Opus 4.6) com streaming → Retorna SSE
+// StaiDOC — Edge Function: process-message (v2 — Security Hardened)
+// Fluxo: Recebe mensagem → Valida → Anonimiza (NER+REGEX) → Grava logs →
+//        Chama API Anthropic (Claude Opus 4.6) com streaming → Retorna SSE
 // ============================================================================
 // Conformidade: LGPD Art. 6/7/12/18/20/37/46 + Marco Civil Art. 15
+// Seguranca: CORS restrito, input validation, prompt injection prevention,
+//            rate limit por contexto, logging paralelo
 // ============================================================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { corsHeaders } from "../_shared/cors.ts";
+import { getCorsHeaders } from "../_shared/cors.ts";
 import { MASTER_PROMPT } from "../_shared/master-prompt.ts";
 import {
   anonymizeContent,
   sha256,
   type DetectedEntity,
 } from "../_shared/anonymizer.ts";
+import {
+  isValidUUID,
+  isValidAuthHeader,
+  sanitizeForPrompt,
+  MAX_CONTENT_LENGTH,
+  MAX_CONTEXT_MESSAGES,
+} from "../_shared/validation.ts";
 
 // ============================================================================
 // Configuracao do modelo — Somente Anthropic
@@ -37,9 +46,11 @@ interface ProcessMessageRequest {
 // Funcao principal
 // ============================================================================
 serve(async (req: Request) => {
+  const cors = getCorsHeaders(req);
+
   // CORS preflight
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+    return new Response("ok", { headers: cors });
   }
 
   try {
@@ -47,8 +58,8 @@ serve(async (req: Request) => {
     // AUTENTICACAO
     // =====================================================================
     const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return jsonResponse({ error: "Token de autenticacao ausente" }, 401);
+    if (!authHeader || !isValidAuthHeader(authHeader)) {
+      return jsonResponse(cors, { error: "Token de autenticacao ausente ou invalido" }, 401);
     }
 
     const supabaseAdmin = createClient(
@@ -67,7 +78,7 @@ serve(async (req: Request) => {
       error: authError,
     } = await supabaseUser.auth.getUser();
     if (authError || !user) {
-      return jsonResponse({ error: "Usuario nao autenticado" }, 401);
+      return jsonResponse(cors, { error: "Usuario nao autenticado" }, 401);
     }
 
     const userId = user.id;
@@ -76,19 +87,34 @@ serve(async (req: Request) => {
     const userAgent = req.headers.get("user-agent") || null;
 
     // =====================================================================
-    // VALIDACAO DE ENTRADA
+    // VALIDACAO DE ENTRADA (Seguranca: prevencao de injection e DoS)
     // =====================================================================
     const body = (await req.json()) as ProcessMessageRequest;
     const { conversation_id, content, has_image = false } = body;
 
     if (!conversation_id || !content) {
       return jsonResponse(
+        cors,
         { error: "conversation_id e content sao obrigatorios" },
         400
       );
     }
 
-    // Verificar que a conversa pertence ao medico autenticado
+    // Validar formato UUID (previne SQL injection e prompt injection)
+    if (!isValidUUID(conversation_id)) {
+      return jsonResponse(cors, { error: "Formato de conversation_id invalido" }, 400);
+    }
+
+    // Validar tamanho do conteudo (previne DoS e custos excessivos na API)
+    if (content.length > MAX_CONTENT_LENGTH) {
+      return jsonResponse(
+        cors,
+        { error: `Mensagem excede o limite de ${MAX_CONTENT_LENGTH} caracteres` },
+        413
+      );
+    }
+
+    // Verificar que a conversa pertence ao medico autenticado (via RLS)
     const { data: conversation, error: convError } = await supabaseUser
       .from("conversations")
       .select("id")
@@ -97,6 +123,7 @@ serve(async (req: Request) => {
 
     if (convError || !conversation) {
       return jsonResponse(
+        cors,
         { error: "Conversa nao encontrada ou sem permissao" },
         403
       );
@@ -147,70 +174,78 @@ serve(async (req: Request) => {
     if (msgError) throw msgError;
 
     // =====================================================================
-    // ETAPA 3: GRAVAR LOGS DE ANONIMIZACAO (prova para auditores ANPD)
+    // ETAPA 3: GRAVAR LOGS DE ANONIMIZACAO EM PARALELO
     // =====================================================================
-
-    // Log principal de anonimizacao
-    await supabaseAdmin.from("anonymization_logs").insert({
-      user_id: userId,
-      message_id: userMessage.id,
-      original_content_hash: originalContentHash,
-      entities_detected: entities.map((e: DetectedEntity) => ({
-        type: e.type,
-        action: e.action,
-        confidence: e.confidence,
-        method: e.method,
-        original_length: e.original_length,
-      })),
-      anonymization_method: "HYBRID",
-      sensitive_data_found: sensitiveDataFound,
-      processing_time_ms: anonymizationTimeMs,
-    });
+    const logPromises: Promise<unknown>[] = [
+      // Log principal de anonimizacao
+      supabaseAdmin.from("anonymization_logs").insert({
+        user_id: userId,
+        message_id: userMessage.id,
+        original_content_hash: originalContentHash,
+        entities_detected: entities.map((e: DetectedEntity) => ({
+          type: e.type,
+          action: e.action,
+          confidence: e.confidence,
+          method: e.method,
+        })),
+        anonymization_method: "HYBRID",
+        sensitive_data_found: sensitiveDataFound,
+        processing_time_ms: anonymizationTimeMs,
+      }),
+      // Log de auditoria da mensagem do medico
+      supabaseAdmin.from("audit_logs").insert({
+        user_id: userId,
+        action: "message_sent",
+        resource_type: "messages",
+        resource_id: userMessage.id,
+        details: {
+          conversation_id,
+          has_image,
+          sensitive_data_found: sensitiveDataFound,
+          entities_count: entities.length,
+          entity_types: entities.map((e: DetectedEntity) => e.type),
+          anonymization_time_ms: anonymizationTimeMs,
+          privacy_warning_triggered: privacyWarningTriggered,
+        },
+        ip_address: ipAddress,
+        user_agent: userAgent,
+      }),
+    ];
 
     // Logs individuais de cada entidade detectada
     if (entities.length > 0) {
-      await supabaseAdmin.from("sensitive_data_detection_logs").insert(
-        entities.map((e: DetectedEntity) => ({
-          user_id: userId,
-          message_id: userMessage.id,
-          detection_type: e.type,
-          detection_method: `REGEX_${e.method}`,
-          confidence_score: e.confidence,
-          action_taken: e.action,
-        }))
+      logPromises.push(
+        supabaseAdmin.from("sensitive_data_detection_logs").insert(
+          entities.map((e: DetectedEntity) => ({
+            user_id: userId,
+            message_id: userMessage.id,
+            detection_type: e.type,
+            detection_method: `REGEX_${e.method}`,
+            confidence_score: e.confidence,
+            action_taken: e.action,
+          }))
+        )
       );
     }
 
-    // Log de auditoria da mensagem do medico
-    await supabaseAdmin.from("audit_logs").insert({
-      user_id: userId,
-      action: "message_sent",
-      resource_type: "messages",
-      resource_id: userMessage.id,
-      details: {
-        conversation_id,
-        has_image,
-        sensitive_data_found: sensitiveDataFound,
-        entities_count: entities.length,
-        entity_types: entities.map((e: DetectedEntity) => e.type),
-        anonymization_time_ms: anonymizationTimeMs,
-        privacy_warning_triggered: privacyWarningTriggered,
-      },
-      ip_address: ipAddress,
-      user_agent: userAgent,
-    });
+    // Executar todos os logs em paralelo (nao bloqueia o fluxo principal)
+    await Promise.allSettled(logPromises);
 
     // =====================================================================
-    // ETAPA 4: BUSCAR HISTORICO DA CONVERSA (contexto para a IA)
+    // ETAPA 4: BUSCAR HISTORICO DA CONVERSA (com limite de seguranca)
     // =====================================================================
     const { data: previousMessages } = await supabaseAdmin
       .from("messages")
       .select("role, content")
       .eq("conversation_id", conversation_id)
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: false })
+      .limit(MAX_CONTEXT_MESSAGES);
+
+    // Reverter para ordem cronologica (buscamos desc para pegar os mais recentes)
+    const chronologicalMessages = (previousMessages || []).reverse();
 
     // Montar array de mensagens para a API Anthropic
-    const apiMessages = (previousMessages || []).map((m) => ({
+    const apiMessages = chronologicalMessages.map((m) => ({
       role: m.role === "system" ? ("user" as const) : (m.role as "user" | "assistant"),
       content: m.content,
     }));
@@ -218,9 +253,11 @@ serve(async (req: Request) => {
     // =====================================================================
     // ETAPA 5: CHAMAR API ANTHROPIC COM STREAMING
     // =====================================================================
+    // Sanitizar conversation_id antes de injetar no prompt (previne prompt injection)
+    const safeSessionId = sanitizeForPrompt(conversation_id);
     const systemPrompt = MASTER_PROMPT
       .replace("{MODEL_NAME}", MODEL_NAME)
-      .replace("{SESSION_ID}", conversation_id);
+      .replace("{SESSION_ID}", safeSessionId);
 
     const anthropicApiKey = Deno.env.get("ANTHROPIC_API_KEY");
     if (!anthropicApiKey) {
@@ -246,11 +283,10 @@ serve(async (req: Request) => {
     });
 
     if (!anthropicResponse.ok) {
-      const errorBody = await anthropicResponse.text();
-      console.error("Erro Anthropic API:", anthropicResponse.status, errorBody);
-      throw new Error(
-        `API Anthropic retornou status ${anthropicResponse.status}`
-      );
+      const statusCode = anthropicResponse.status;
+      // Log apenas o status code, nao o corpo completo (pode conter dados sensiveis)
+      console.error("Erro Anthropic API:", statusCode);
+      throw new Error(`API Anthropic retornou status ${statusCode}`);
     }
 
     // =====================================================================
@@ -311,7 +347,7 @@ serve(async (req: Request) => {
           }
 
           // =================================================================
-          // ETAPA 7: STREAM FINALIZADO — Gravar resposta da IA e logs
+          // ETAPA 7: STREAM FINALIZADO — Gravar resposta e logs em paralelo
           // =================================================================
           const aiContentHash = await sha256(fullResponse);
           const totalProcessingTime = Date.now() - processingStart;
@@ -333,50 +369,51 @@ serve(async (req: Request) => {
             .single();
 
           if (aiMessage) {
-            // Contar referencias na resposta
             const referencesCount = (
               fullResponse.match(/\[\d+\]/g) || []
             ).length;
 
-            // Log de explicabilidade (Art. 20 LGPD)
-            await supabaseAdmin.from("explainability_logs").insert({
-              user_id: userId,
-              message_id: aiMessage.id,
-              conversation_id,
-              ai_model_used: MODEL_ID,
-              explanation_level: 2,
-              explanation_content:
-                `Resposta gerada pelo modelo ${MODEL_NAME} com temperatura 0.2 ` +
-                `para maxima precisao clinica. O sistema utilizou o prompt mestre ` +
-                `STAIDOC v1.0 com instrucoes de raciocinio clinico baseado em evidencias. ` +
-                `Referencias extraidas do PubMed/MEDLINE (${referencesCount} citacoes). ` +
-                `O texto do medico foi anonimizado antes do processamento ` +
-                `(${entities.length} entidade(s) sensivel(is) ` +
-                `${sensitiveDataFound ? "detectada(s) e removida(s)" : "nao detectada(s)"}). ` +
-                `Tempo total de processamento: ${totalProcessingTime}ms.`,
-              confidence_score: 0.85,
-              disclaimer_shown: true,
-              human_in_the_loop_confirmed: false,
-            });
-
-            // Log de auditoria da resposta da IA
-            await supabaseAdmin.from("audit_logs").insert({
-              user_id: userId,
-              action: "message_received",
-              resource_type: "messages",
-              resource_id: aiMessage.id,
-              details: {
+            // Gravar explainability e audit em paralelo (nao bloqueia o stream)
+            await Promise.allSettled([
+              // Log de explicabilidade (Art. 20 LGPD)
+              supabaseAdmin.from("explainability_logs").insert({
+                user_id: userId,
+                message_id: aiMessage.id,
                 conversation_id,
-                model_used: MODEL_ID,
-                tokens_used: outputTokens,
-                references_count: referencesCount,
-                processing_time_ms: totalProcessingTime,
-                privacy_flag: sensitiveDataFound,
-                anonymization_entities_count: entities.length,
-              },
-              ip_address: ipAddress,
-              user_agent: userAgent,
-            });
+                ai_model_used: MODEL_ID,
+                explanation_level: 2,
+                explanation_content:
+                  `Resposta gerada pelo modelo ${MODEL_NAME} com temperatura 0.2 ` +
+                  `para maxima precisao clinica. O sistema utilizou o prompt mestre ` +
+                  `STAIDOC v1.0 com instrucoes de raciocinio clinico baseado em evidencias. ` +
+                  `Referencias extraidas do PubMed/MEDLINE (${referencesCount} citacoes). ` +
+                  `O texto do medico foi anonimizado antes do processamento ` +
+                  `(${entities.length} entidade(s) sensivel(is) ` +
+                  `${sensitiveDataFound ? "detectada(s) e removida(s)" : "nao detectada(s)"}). ` +
+                  `Tempo total de processamento: ${totalProcessingTime}ms.`,
+                confidence_score: 0.85,
+                disclaimer_shown: true,
+                human_in_the_loop_confirmed: false,
+              }),
+              // Log de auditoria da resposta da IA
+              supabaseAdmin.from("audit_logs").insert({
+                user_id: userId,
+                action: "message_received",
+                resource_type: "messages",
+                resource_id: aiMessage.id,
+                details: {
+                  conversation_id,
+                  model_used: MODEL_ID,
+                  tokens_used: outputTokens,
+                  references_count: referencesCount,
+                  processing_time_ms: totalProcessingTime,
+                  privacy_flag: sensitiveDataFound,
+                  anonymization_entities_count: entities.length,
+                },
+                ip_address: ipAddress,
+                user_agent: userAgent,
+              }),
+            ]);
           }
 
           // Sinal de fim do stream
@@ -402,7 +439,7 @@ serve(async (req: Request) => {
     // =====================================================================
     return new Response(stream, {
       headers: {
-        ...corsHeaders,
+        ...cors,
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
@@ -410,16 +447,20 @@ serve(async (req: Request) => {
     });
   } catch (error) {
     console.error("Erro em process-message:", error);
-    return jsonResponse({ error: "Erro interno ao processar mensagem" }, 500);
+    return jsonResponse(getCorsHeaders(req), { error: "Erro interno ao processar mensagem" }, 500);
   }
 });
 
 // ============================================================================
 // Utilitarios
 // ============================================================================
-function jsonResponse(body: Record<string, unknown>, status: number) {
+function jsonResponse(
+  cors: Record<string, string>,
+  body: Record<string, unknown>,
+  status: number
+) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: { ...cors, "Content-Type": "application/json" },
   });
 }
