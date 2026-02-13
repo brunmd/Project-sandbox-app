@@ -1,0 +1,10 @@
+# OS
+.DS_Store
+
+# Environment variables (NUNCA commitar chaves)
+.env
+.env.local
+.env.production
+
+# Supabase local
+supabase/.temp/
