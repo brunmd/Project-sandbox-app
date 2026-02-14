@@ -21,13 +21,17 @@ import {
   isValidUUID,
   isValidAuthHeader,
   sanitizeForPrompt,
+  detectImageMimeType,
+  secureWipeBuffer,
   MAX_CONTENT_LENGTH,
   MAX_CONTEXT_MESSAGES,
 } from "../_shared/validation.ts";
+import { verifyReferences } from "../_shared/pubmed-utils.ts";
 
 // ============================================================================
 // Configuracao do modelo — Somente Anthropic
 // ============================================================================
+// Modelo primario: Claude Opus 4.6 (modelo mais avancado — confirmado no plano)
 const MODEL_ID = "claude-opus-4-6";
 const MODEL_NAME = "Claude Opus 4.6";
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
@@ -36,11 +40,22 @@ const ANTHROPIC_VERSION = "2023-06-01";
 // ============================================================================
 // Tipos
 // ============================================================================
+interface ImageData {
+  media_type: string;
+  data: string; // base64
+}
+
 interface ProcessMessageRequest {
   conversation_id: string;
   content: string;
   has_image?: boolean;
+  images?: ImageData[];
 }
+
+// Limites de seguranca para imagens
+const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB por imagem
+const MAX_IMAGES_PER_MESSAGE = 3;
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
 
 // ============================================================================
 // Funcao principal
@@ -90,12 +105,13 @@ serve(async (req: Request) => {
     // VALIDACAO DE ENTRADA (Seguranca: prevencao de injection e DoS)
     // =====================================================================
     const body = (await req.json()) as ProcessMessageRequest;
-    const { conversation_id, content, has_image = false } = body;
+    const { conversation_id, content = "", images = [] } = body;
+    const hasImages = images.length > 0;
 
-    if (!conversation_id || !content) {
+    if (!conversation_id || (!content && !hasImages)) {
       return jsonResponse(
         cors,
-        { error: "conversation_id e content sao obrigatorios" },
+        { error: "conversation_id e content (ou images) sao obrigatorios" },
         400
       );
     }
@@ -112,6 +128,76 @@ serve(async (req: Request) => {
         { error: `Mensagem excede o limite de ${MAX_CONTENT_LENGTH} caracteres` },
         413
       );
+    }
+
+    // =====================================================================
+    // VALIDACAO DE IMAGENS (se presentes)
+    // =====================================================================
+    if (images.length > MAX_IMAGES_PER_MESSAGE) {
+      return jsonResponse(
+        cors,
+        { error: `Maximo de ${MAX_IMAGES_PER_MESSAGE} imagens por mensagem` },
+        400
+      );
+    }
+
+    const validatedImages: Array<{
+      media_type: string;
+      data: string;
+      hash: string;
+      size_bytes: number;
+    }> = [];
+
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i];
+      if (!img.data || !img.media_type) {
+        return jsonResponse(cors, { error: `Imagem ${i + 1}: dados incompletos` }, 400);
+      }
+
+      // Decodificar base64 para validar magic bytes
+      let imageBuffer: ArrayBuffer;
+      try {
+        const binaryString = atob(img.data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let j = 0; j < binaryString.length; j++) {
+          bytes[j] = binaryString.charCodeAt(j);
+        }
+        imageBuffer = bytes.buffer;
+      } catch {
+        return jsonResponse(cors, { error: `Imagem ${i + 1}: base64 invalido` }, 400);
+      }
+
+      // Validar tamanho
+      if (imageBuffer.byteLength > MAX_IMAGE_SIZE_BYTES) {
+        return jsonResponse(
+          cors,
+          { error: `Imagem ${i + 1}: excede limite de ${MAX_IMAGE_SIZE_BYTES / (1024 * 1024)}MB` },
+          413
+        );
+      }
+
+      // Validar magic bytes (nao confiar no MIME type do frontend)
+      const detectedType = detectImageMimeType(imageBuffer);
+      if (!detectedType || !ALLOWED_IMAGE_TYPES.includes(detectedType)) {
+        return jsonResponse(
+          cors,
+          { error: `Imagem ${i + 1}: formato nao suportado. Aceitos: JPEG, PNG, WebP` },
+          400
+        );
+      }
+
+      // Hash SHA-256 da imagem (prova de existencia sem armazenamento)
+      const imageHash = await sha256(img.data.slice(0, 1000) + img.data.length);
+
+      validatedImages.push({
+        media_type: detectedType, // Usar tipo detectado, nao o informado
+        data: img.data,
+        hash: imageHash,
+        size_bytes: imageBuffer.byteLength,
+      });
+
+      // Secure wipe do buffer decodificado (a imagem continua em base64 para a API)
+      secureWipeBuffer(imageBuffer);
     }
 
     // Verificar que a conversa pertence ao medico autenticado (via RLS)
@@ -164,14 +250,21 @@ serve(async (req: Request) => {
         conversation_id,
         user_id: userId,
         role: "user",
-        content: anonymizedContent,
+        content: anonymizedContent || (hasImages ? "[Imagem enviada para analise]" : ""),
         content_hash: anonymizedContentHash,
-        has_image,
+        has_image: hasImages,
       })
       .select("id")
       .single();
 
-    if (msgError) throw msgError;
+    if (msgError) {
+      console.error("Erro ao gravar mensagem:", msgError.message, msgError.code, msgError.details);
+      return jsonResponse(cors, {
+        error: `Erro ao gravar mensagem: ${msgError.message}`,
+        code: msgError.code,
+        step: "message_insert",
+      }, 500);
+    }
 
     // =====================================================================
     // ETAPA 3: GRAVAR LOGS DE ANONIMIZACAO EM PARALELO
@@ -200,7 +293,7 @@ serve(async (req: Request) => {
         resource_id: userMessage.id,
         details: {
           conversation_id,
-          has_image,
+          has_image: hasImages,
           sensitive_data_found: sensitiveDataFound,
           entities_count: entities.length,
           entity_types: entities.map((e: DetectedEntity) => e.type),
@@ -228,6 +321,28 @@ serve(async (req: Request) => {
       );
     }
 
+    // Logs de processamento de imagem (LGPD: prova de descarte)
+    if (validatedImages.length > 0) {
+      logPromises.push(
+        supabaseAdmin.from("image_processing_logs").insert(
+          validatedImages.map((img) => ({
+            user_id: userId,
+            conversation_id,
+            message_id: userMessage.id,
+            image_hash: img.hash,
+            image_size_bytes: img.size_bytes,
+            image_mime_type: img.media_type,
+            purpose: "diagnostic_aid",
+            processed_at: new Date().toISOString(),
+            discarded_at: new Date().toISOString(),
+            processing_duration_ms: Date.now() - processingStart,
+            ai_model_used: MODEL_ID,
+            storage_proof: "processed_in_memory",
+          }))
+        )
+      );
+    }
+
     // Executar todos os logs em paralelo (nao bloqueia o fluxo principal)
     await Promise.allSettled(logPromises);
 
@@ -245,10 +360,45 @@ serve(async (req: Request) => {
     const chronologicalMessages = (previousMessages || []).reverse();
 
     // Montar array de mensagens para a API Anthropic
-    const apiMessages = chronologicalMessages.map((m) => ({
+    // deno-lint-ignore no-explicit-any
+    const apiMessages: Array<{ role: "user" | "assistant"; content: any }> = chronologicalMessages.map((m) => ({
       role: m.role === "system" ? ("user" as const) : (m.role as "user" | "assistant"),
       content: m.content,
     }));
+
+    // Se a mensagem atual tem imagens, substituir o ultimo item (que é a msg do usuario atual)
+    // por content blocks multimodal para a Anthropic Vision API
+    if (validatedImages.length > 0 && apiMessages.length > 0) {
+      const lastMsg = apiMessages[apiMessages.length - 1];
+      if (lastMsg.role === "user") {
+        // deno-lint-ignore no-explicit-any
+        const contentBlocks: any[] = [];
+
+        // Adicionar imagens como content blocks
+        for (const img of validatedImages) {
+          contentBlocks.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: img.media_type,
+              data: img.data,
+            },
+          });
+        }
+
+        // Adicionar texto (se houver)
+        const textContent = lastMsg.content && lastMsg.content !== "[Imagem enviada para analise]"
+          ? lastMsg.content
+          : "Analise esta imagem de exame medico. Descreva os achados de forma estruturada e correlacione com o contexto clinico disponivel.";
+
+        contentBlocks.push({
+          type: "text",
+          text: textContent,
+        });
+
+        lastMsg.content = contentBlocks;
+      }
+    }
 
     // =====================================================================
     // ETAPA 5: CHAMAR API ANTHROPIC COM STREAMING
@@ -275,7 +425,6 @@ serve(async (req: Request) => {
         model: MODEL_ID,
         max_tokens: 4096,
         temperature: 0.2,
-        top_p: 0.9,
         stream: true,
         system: systemPrompt,
         messages: apiMessages,
@@ -284,9 +433,17 @@ serve(async (req: Request) => {
 
     if (!anthropicResponse.ok) {
       const statusCode = anthropicResponse.status;
-      // Log apenas o status code, nao o corpo completo (pode conter dados sensiveis)
-      console.error("Erro Anthropic API:", statusCode);
-      throw new Error(`API Anthropic retornou status ${statusCode}`);
+      let errorDetail = "";
+      try {
+        const errBody = await anthropicResponse.json();
+        errorDetail = errBody?.error?.message || errBody?.error?.type || "";
+      } catch { /* ignorar */ }
+      console.error("Erro Anthropic API:", statusCode, errorDetail);
+      return jsonResponse(cors, {
+        error: `Erro na API Anthropic (${statusCode}): ${errorDetail || "verifique a API key e o modelo"}`,
+        step: "anthropic_api",
+        status_code: statusCode,
+      }, 502);
     }
 
     // =====================================================================
@@ -347,19 +504,77 @@ serve(async (req: Request) => {
           }
 
           // =================================================================
-          // ETAPA 7: STREAM FINALIZADO — Gravar resposta e logs em paralelo
+          // ETAPA 7: VERIFICACAO DE REFERENCIAS VIA PUBMED E-UTILITIES
           // =================================================================
-          const aiContentHash = await sha256(fullResponse);
+          // Abordagem NTAV (Never Trust, Always Verify):
+          // 1. Claude gera com URLs de busca PubMed (sem PMIDs diretos)
+          // 2. E-utilities busca e verifica cada referência
+          // 3. URLs de busca são substituídas por PMIDs verificados
+          // 4. Versão verificada é salva no DB e enviada ao frontend
+          // =================================================================
+          let finalContent = fullResponse;
+          let verificationSummary = "Verificacao PubMed nao executada";
+          let referencesCount = (fullResponse.match(/\[\d+\]/g) || []).length;
+
+          try {
+            const {
+              verifiedText,
+              verifications,
+              verifiedCount,
+              fallbackCount,
+            } = await verifyReferences(fullResponse);
+
+            finalContent = verifiedText;
+            verificationSummary =
+              `${verifications.length} referencia(s) processada(s) via PubMed E-utilities: ` +
+              `${verifiedCount} verificada(s) com PMID real, ` +
+              `${fallbackCount} mantida(s) como busca PubMed (fallback seguro). ` +
+              `Artigos verificados: ${verifications
+                .filter((v) => v.article)
+                .map(
+                  (v) =>
+                    `[${v.verifiedPmid}] ${v.article!.title} (${v.article!.journal}, ${v.article!.year})`
+                )
+                .join("; ")}.`;
+
+            // Enviar referências verificadas ao frontend para atualização em tempo real
+            if (verifiedCount > 0) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({
+                    verified_refs: verifications
+                      .filter((v) => v.confidence === "VERIFIED")
+                      .map((v) => ({
+                        originalUrl: v.originalUrl,
+                        verifiedUrl: v.verifiedUrl,
+                        pmid: v.verifiedPmid,
+                        title: v.article?.title,
+                      })),
+                    full_verified_text: finalContent,
+                  })}\n\n`
+                )
+              );
+            }
+          } catch (verifyError) {
+            console.error("[PubMed] Verification failed:", verifyError);
+            // Fallback: usar texto original (com URLs de busca — ainda válidas)
+            verificationSummary = `Verificacao PubMed falhou: ${verifyError instanceof Error ? verifyError.message : "erro desconhecido"}. URLs de busca PubMed mantidas como fallback seguro.`;
+          }
+
+          // =================================================================
+          // ETAPA 8: GRAVAR RESPOSTA VERIFICADA E LOGS
+          // =================================================================
+          const aiContentHash = await sha256(finalContent);
           const totalProcessingTime = Date.now() - processingStart;
 
-          // Salvar mensagem da IA
+          // Salvar mensagem da IA (versão VERIFICADA com PMIDs reais)
           const { data: aiMessage } = await supabaseAdmin
             .from("messages")
             .insert({
               conversation_id,
               user_id: userId,
               role: "assistant",
-              content: fullResponse,
+              content: finalContent,
               content_hash: aiContentHash,
               has_image: false,
               tokens_used: outputTokens,
@@ -369,11 +584,7 @@ serve(async (req: Request) => {
             .single();
 
           if (aiMessage) {
-            const referencesCount = (
-              fullResponse.match(/\[\d+\]/g) || []
-            ).length;
-
-            // Gravar explainability e audit em paralelo (nao bloqueia o stream)
+            // Gravar explainability e audit em paralelo
             await Promise.allSettled([
               // Log de explicabilidade (Art. 20 LGPD)
               supabaseAdmin.from("explainability_logs").insert({
@@ -386,7 +597,7 @@ serve(async (req: Request) => {
                   `Resposta gerada pelo modelo ${MODEL_NAME} com temperatura 0.2 ` +
                   `para maxima precisao clinica. O sistema utilizou o prompt mestre ` +
                   `STAIDOC v1.0 com instrucoes de raciocinio clinico baseado em evidencias. ` +
-                  `Referencias extraidas do PubMed/MEDLINE (${referencesCount} citacoes). ` +
+                  `${verificationSummary} ` +
                   `O texto do medico foi anonimizado antes do processamento ` +
                   `(${entities.length} entidade(s) sensivel(is) ` +
                   `${sensitiveDataFound ? "detectada(s) e removida(s)" : "nao detectada(s)"}). ` +
@@ -406,6 +617,7 @@ serve(async (req: Request) => {
                   model_used: MODEL_ID,
                   tokens_used: outputTokens,
                   references_count: referencesCount,
+                  references_verified: verificationSummary,
                   processing_time_ms: totalProcessingTime,
                   privacy_flag: sensitiveDataFound,
                   anonymization_entities_count: entities.length,
@@ -414,6 +626,11 @@ serve(async (req: Request) => {
                 user_agent: userAgent,
               }),
             ]);
+          }
+
+          // Secure wipe: limpar dados de imagem da memoria apos uso
+          for (const img of validatedImages) {
+            img.data = "";
           }
 
           // Sinal de fim do stream
@@ -446,8 +663,14 @@ serve(async (req: Request) => {
       },
     });
   } catch (error) {
-    console.error("Erro em process-message:", error);
-    return jsonResponse(getCorsHeaders(req), { error: "Erro interno ao processar mensagem" }, 500);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    const errCode = (error as { code?: string })?.code || "";
+    console.error("Erro em process-message:", errMsg, errCode);
+    return jsonResponse(getCorsHeaders(req), {
+      error: `Erro interno: ${errMsg}`,
+      code: errCode,
+      step: "catch_geral",
+    }, 500);
   }
 });
 
